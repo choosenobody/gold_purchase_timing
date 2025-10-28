@@ -1,0 +1,35 @@
+name: Gold Trend Alerts
+
+on:
+  schedule:
+    - cron: "0 13 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run or status"
+        required: true
+        default: "status"
+      symbol:
+        description: "Override symbol"
+        required: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance requests pandas
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python gold_trend_bot.py --mode ${{ github.event.inputs.mode || 'status' }} --symbol ${{ github.event.inputs.symbol || 'GC=F' }}
