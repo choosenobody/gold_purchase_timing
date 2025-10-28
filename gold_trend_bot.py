@@ -27,7 +27,12 @@ def get_price_and_atr(symbol="GC=F"):
 def format_msg(price, atr):
     text = f"*Gold Trend | Status*  \n价格: *{price:.2f}* USD/oz"
     if atr is not None:
-        text += f"\nATR(14): ~*{atr:.1f}*"
+        atr_pct = (atr / price) * 100.0
+        m1 = price - 1.0 * atr
+        m15 = price - 1.5 * atr
+        m2 = price - 2.0 * atr
+        text += f"\nATR(14): ~*{atr:.1f}* (*{atr_pct:.2f}%*)"
+        text += f"\n动态参考(ATR基准): 1.0×≈*{m1:.0f}*, 1.5×≈*{m15:.0f}*, 2.0×≈*{m2:.0f}*"
     return text
 
 def main():
