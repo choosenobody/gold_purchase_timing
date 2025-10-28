@@ -20,3 +20,17 @@ jobs:
           python-version: '3.11'
       - name: Install deps
         run: pip install yfinance requests
+      - name: Patch CN (phase 1)
+        run: |
+          python - <<'PY'
+          p='gold_trend_bot.py'
+          s=open(p,'r',encoding='utf-8').read()
+          repl=[
+            ('Gold Trend | Status','Gold Trend | \u72b6\u6001'),
+            ('Price:','\u4ef7\u683c:')
+          ]
+          for a,b in repl:
+              s=s.replace(a,b)
+          open(p,'w',encoding='utf-8').write(s)
+          print('patched phase1')
+          PY
