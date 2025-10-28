@@ -7,3 +7,16 @@ on:
         description: 'run or status'
         required: false
         default: 'status'
+  schedule:
+    - cron: '0 13 * * 1-5'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install yfinance requests
