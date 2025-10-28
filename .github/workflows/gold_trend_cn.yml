@@ -1,1 +1,9 @@
 name: Gold Trend CN
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'run or status'
+        required: false
+        default: 'status'
