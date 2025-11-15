@@ -51,6 +51,7 @@ jobs:
               ("*Upper confirm*:", "*上沿确认*:"),
               ("(if holds, consider add to 70-80%)", "(若企稳, 可补至 70–80%)"),
               ("--- Realtime signals ---", "—— 实时信号 ——"),
+              ("RMB/g", "元/克"),
           ]
 
           for a, b in repl:
