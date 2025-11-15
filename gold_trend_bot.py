@@ -6,6 +6,7 @@ import sys
 import time
 import json
 import argparse
+import datetime
 from typing import Dict, Any
 
 import requests
@@ -17,6 +18,7 @@ except Exception as e:
     sys.exit(1)
 
 STATE_FILE = "gold_trend_state.json"
+OZ_TO_GRAM = 31.1034768
 
 # Strategy config (ASCII-only so workflows can patch/translate safely)
 CFG: Dict[str, Any] = {
@@ -28,6 +30,8 @@ CFG: Dict[str, Any] = {
     "plan_gold_max_pct": 0.18,
     # ChatGPT 对黄金 3–5 年视角“合理价格区间”的估算（结合 M2 扩张 / 实际利率等）
     "fair_value_band": [3600, 4200],
+    # 默认的美元兑人民币汇率，用于 USD/oz -> RMB/g 的换算（可被环境变量 FX_USDCNY 覆盖）
+    "fx_usdcny_default": 7.2,
     # 上沿确认区间：如果价格在这里站稳，可以考虑先建到 30% 计划仓（≈5.4% 总资产）
     "confirm_zone_breakout": {"upper_confirm": [4080, 4100]},
     "levels": {
@@ -61,6 +65,26 @@ CFG: Dict[str, Any] = {
         # kept for backward compat; we now show 1.0/1.5/2.0× in text
         "mul_stop": 1.5,
     },
+    # === Options lotto 黑天鹅对冲配置 ===
+    "options_lotto": {
+        "enabled": True,
+        # 使用哪个标的的期权，这里默认用 GLD
+        "underlying": "GLD",
+        # 目标期限（天数），比如 365 = 一年左右
+        "target_days": 365,
+        # 可以接受的 tenor 偏差范围
+        "tenor_tolerance_days": 90,
+        # 深度虚值范围：行权价 ≈ 现价 * (1 + otm_low ... 1 + otm_high)
+        "otm_low": 0.35,   # +35% OTM
+        "otm_high": 0.60,  # +60% OTM
+        # 平均隐含波动率阈值（例如 0.25 = 25%）
+        # 低于这个阈值才提示“彩票”想法
+        "iv_threshold": 0.25,
+        # 建议的最大资金占比（总组合），例如 0.005 = 0.5%
+        "max_allocation_pct": 0.005,
+        # 是否只在第一次满足条件时提醒一次
+        "notify_once": True,
+    },
 }
 
 API = "https://api.telegram.org/bot{}/sendMessage"
@@ -71,7 +95,7 @@ def tg(token: str, chat: str, text: str) -> bool:
     r = requests.post(
         API.format(token),
         json={"chat_id": chat, "text": text, "parse_mode": "Markdown"},
-        timeout=15,
+        timeout=30,
     )
     if not r.ok:
         print("Telegram failed", r.status_code, r.text, file=sys.stderr)
@@ -95,7 +119,6 @@ def save_state(st: Dict[str, Any]) -> None:
 
 def price_and_atr(symbol: str, look: int = 14):
     """Fetch last close price and a simple ATR-like indicator (avg high-low)."""
-    # We request at least look+2 days, but not less than 20 days
     period_days = max(look + 2, 20)
     d = yf.Ticker(symbol).history(period=f"{period_days}d", interval="1d")
     if d.empty:
@@ -108,12 +131,38 @@ def price_and_atr(symbol: str, look: int = 14):
     return p, a
 
 
+def _get_fx_rate(cfg: Dict[str, Any]):
+    """
+    获取 USD/CNY 汇率：
+    优先读环境变量 FX_USDCNY；
+    其次使用 cfg['fx_usdcny_default']；
+    若都不可用则返回 None。
+    """
+    env = os.getenv("FX_USDCNY", "").strip()
+    if env:
+        try:
+            v = float(env)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    v = cfg.get("fx_usdcny_default", 7.2)
+    try:
+        v = float(v)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return None
+
+
 def fmt_status(cfg: Dict[str, Any], p: float, a: float, title: str) -> str:
     """Format the status / heartbeat / signals header."""
     L = cfg["levels"]
     plan_max = float(cfg.get("plan_gold_max_pct", 0.0))
     fair_band = cfg.get("fair_value_band", [None, None])
     fair_lo, fair_hi = fair_band if len(fair_band) == 2 else (None, None)
+    fx_rate = _get_fx_rate(cfg)
 
     out = [f"*{title}*  ", f"Price: *{p:.2f}* USD/oz"]
 
@@ -169,13 +218,20 @@ def fmt_status(cfg: Dict[str, Any], p: float, a: float, title: str) -> str:
         target_plan = float(b.get("target_plan_pct", 0.0))
         plan_percent = target_plan * 100.0
         portfolio_percent = plan_max * target_plan * 100.0
+        if fx_rate:
+            cny_lo = b["low"] * fx_rate / OZ_TO_GRAM
+            cny_hi = b["high"] * fx_rate / OZ_TO_GRAM
+            rmb_part = ", ~{lo:.0f}-{hi:.0f} RMB/g".format(lo=cny_lo, hi=cny_hi)
+        else:
+            rmb_part = ""
         out.append(
-            "- {name}: {lo:.0f}-{hi:.0f} -> target *{plan:.0f}% plan* (~*{pf:.1f}%* of portfolio)".format(
+            "- {name}: {lo:.0f}-{hi:.0f} -> target *{plan:.0f}% plan* (~*{pf:.1f}%* of portfolio{rmb})".format(
                 name=b["name"],
                 lo=b["low"],
                 hi=b["high"],
                 plan=plan_percent,
                 pf=portfolio_percent,
+                rmb=rmb_part,
             )
         )
 
@@ -206,6 +262,107 @@ def mark_once(st: Dict[str, Any], key: str) -> None:
     st.setdefault("notified", {})[key] = True
 
 
+def options_lotto_check(
+    cfg: Dict[str, Any],
+    st: Dict[str, Any],
+    gold_price_spot: float,
+) -> str | None:
+    """
+    检查是否满足“买一年期深度虚值看涨期权”的黑天鹅彩票条件：
+    1) 金价落在便宜区（Band B / Band C）
+    2) GLD 一年期深 OTM call 的平均隐含波低于阈值
+    """
+    opt_cfg = cfg.get("options_lotto", {})
+    if not opt_cfg or not opt_cfg.get("enabled", False):
+        return None
+
+    # 只在 Band B / Band C 这类便宜区间里考虑 options lotto
+    buy_bands = cfg["levels"]["buy_bands"]
+    cheap_band_names = {"Band B", "Band C"}
+    in_cheap_zone = any(
+        (b["name"] in cheap_band_names) and in_band(gold_price_spot, b["low"], b["high"])
+        for b in buy_bands
+    )
+    if not in_cheap_zone:
+        return None
+
+    # 控制频率：只提醒一次，直到状态重置
+    if opt_cfg.get("notify_once", True) and st.get("options_lotto_suggested", False):
+        return None
+
+    try:
+        underlying = opt_cfg.get("underlying", "GLD")
+        t = yf.Ticker(underlying)
+
+        # 1) 挑最近的一年期到期日
+        today = datetime.date.today()
+        target_days = int(opt_cfg.get("target_days", 365))
+        tol = int(opt_cfg.get("tenor_tolerance_days", 90))
+        best_exp = None
+        best_diff = None
+
+        # yfinance 提供的 options 列表是字符串日期
+        for exp_str in t.options:
+            try:
+                exp = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            d = abs((exp - today).days - target_days)
+            if best_diff is None or d < best_diff:
+                best_diff = d
+                best_exp = exp_str
+
+        if best_exp is None or (best_diff is not None and best_diff > tol):
+            return None
+
+        # 2) 拉期权链，取 calls
+        chain = t.option_chain(best_exp)
+        calls = chain.calls
+        if "impliedVolatility" not in calls.columns:
+            return None
+
+        # 3) 取 GLD 当前价格
+        hist = t.history(period="2d", interval="1d")
+        if hist.empty:
+            return None
+        gld_price = float(hist["Close"].dropna().iloc[-1])
+
+        # 4) 过滤 35%–60% OTM 的 call，算平均隐含波
+        otm_low = float(opt_cfg.get("otm_low", 0.35))
+        otm_high = float(opt_cfg.get("otm_high", 0.60))
+        lo_strike = gld_price * (1.0 + otm_low)
+        hi_strike = gld_price * (1.0 + otm_high)
+
+        sub = calls[(calls["strike"] >= lo_strike) & (calls["strike"] <= hi_strike)]
+        if sub.empty or "impliedVolatility" not in sub:
+            return None
+
+        iv_mean = float(sub["impliedVolatility"].mean())
+        iv_threshold = float(opt_cfg.get("iv_threshold", 0.25))
+
+        if iv_mean > iv_threshold:
+            # 隐含波太高，这时候不适合买彩票
+            return None
+
+        max_alloc = float(opt_cfg.get("max_allocation_pct", 0.005))
+        msg = (
+            "Options lotto idea (tail hedge):\n"
+            f"- Underlying: {underlying}, spot ~{gld_price:.2f} USD\n"
+            f"- Use ~1Y deep OTM calls (expiry {best_exp}, strikes ≈ {lo_strike:.0f}–{hi_strike:.0f})\n"
+            f"- Avg implied vol: ~{iv_mean*100:.1f}% (below threshold {iv_threshold*100:.1f}%)\n"
+            f"- Suggested max allocation: ~{max_alloc*100:.2f}% of total portfolio per year\n"
+            "Idea: reserve this as a black-swan hedge, not a main P&L driver."
+        )
+
+        st["options_lotto_suggested"] = True
+        return msg
+
+    except Exception as e:
+        # 不要影响主流程
+        print("options lotto check failed:", e, file=sys.stderr)
+        return None
+
+
 def check_and_alert(
     cfg: Dict[str, Any],
     p: float,
@@ -219,6 +376,7 @@ def check_and_alert(
     L = cfg["levels"]
     once = bool(cfg.get("notify_once_per_band", True))
     plan_max = float(cfg.get("plan_gold_max_pct", 0.0))
+    fx_rate = _get_fx_rate(cfg)
 
     # Buy bands
     for b in L["buy_bands"]:
@@ -228,15 +386,22 @@ def check_and_alert(
                 target_plan = float(b.get("target_plan_pct", 0.0))
                 plan_percent = target_plan * 100.0
                 portfolio_percent = plan_max * target_plan * 100.0
+                if fx_rate:
+                    cny_lo = b["low"] * fx_rate / OZ_TO_GRAM
+                    cny_hi = b["high"] * fx_rate / OZ_TO_GRAM
+                    rmb_part = ", ~{lo:.0f}-{hi:.0f} RMB/g".format(lo=cny_lo, hi=cny_hi)
+                else:
+                    rmb_part = ""
                 msgs.append(
                     "Enter buy band *{name}* {lo}-{hi} | price *{p:.2f}* -> "
-                    "target *{plan:.0f}% plan* (~*{pf:.1f}%* of portfolio, scale in)".format(
+                    "target *{plan:.0f}% plan* (~*{pf:.1f}%* of portfolio{rmb}, scale in)".format(
                         name=b["name"],
                         lo=b["low"],
                         hi=b["high"],
                         p=p,
                         plan=plan_percent,
                         pf=portfolio_percent,
+                        rmb=rmb_part,
                     )
                 )
                 mark_once(st, k)
@@ -285,6 +450,11 @@ def check_and_alert(
             f"- Loose       2.0x: ~*{m2:.0f}*"
         )
         msgs.append("Rule: if close < your stop -> cut 50–100% per plan.")
+
+    # Options lotto idea (black-swan hedge)
+    lotto_msg = options_lotto_check(cfg, st, gold_price_spot=p)
+    if lotto_msg:
+        msgs.append(lotto_msg)
 
     if msgs:
         header = fmt_status(cfg, p, a, title="Gold Trend | Signals")
